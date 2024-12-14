@@ -1,0 +1,157 @@
+---
+
+- name: OpenStack Installation Playbook
+  hosts: Ubuntu and CentOS
+  become: yes
+  vars:
+    openstack_packages:
+      ubuntu:
+        - software-properties-common
+        - python3-openstackclient
+        - keystone
+        - glance
+        - nova-api
+        - nova-conductor
+        - nova-scheduler
+      centos:
+        - centos-release-openstack-train
+        - openstack-utils
+        - openstack-keystone
+        - openstack-glance
+        - openstack-nova-api
+        - openstack-nova-conductor
+        - openstack-nova-scheduler
+    os_family: "{{ ansible_os_family | lower }}"
+
+  tasks:
+  - name: Update package manager cache
+    apt:
+      update_cache: yes
+      cache_valid_time: 3600
+    register: apt_output
+
+  - name: Install EPEL repository for CentOS
+    yum:
+      name: epel-release
+      state: present
+    when: os_family == 'redhat'
+
+  - name: Install required packages
+    package:
+      name: "{{ openstack_packages[os_family] }}"
+      state: present
+
+  - name: Install MariaDB server
+    package:
+      name:
+        - mariadb-server
+        - python3-PyMySQL
+      state: present
+
+  - name: Start and enable MariaDB service
+    service:
+      name: mariadb
+      state: started
+      enabled: true
+
+  - name: Secure MariaDB installation
+    shell: |
+      mysql -u root <<EOF
+      UPDATE mysql.user SET Password=PASSWORD('securepassword') WHERE User='root';
+      DELETE FROM mysql.user WHERE User='';
+      DELETE FROM mysql.db WHERE Db='test' OR Db='test\_%';
+      FLUSH PRIVILEGES;
+      EOF
+
+  - name: Configure Keystone database
+    shell: |
+      mysql -u root -psecurepassword <<EOF
+      CREATE DATABASE keystone;
+      GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'localhost' IDENTIFIED BY 'keystonepass';
+      FLUSH PRIVILEGES;
+      EOF
+
+  - name: Configure Glance database
+    shell: |
+      mysql -u root -psecurepassword <<EOF
+      CREATE DATABASE glance;
+      GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'localhost' IDENTIFIED BY 'glancepass';
+      FLUSH PRIVILEGES;
+      EOF
+
+  - name: Configure Nova database
+    shell: |
+      mysql -u root -psecurepassword <<EOF
+      CREATE DATABASE nova;
+      GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'localhost' IDENTIFIED BY 'novapass';
+      FLUSH PRIVILEGES;
+      EOF
+
+  - name: Keystone - Configure keystone.conf
+    blockinfile:
+      path: /etc/keystone/keystone.conf
+      marker: "# {mark} ANSIBLE MANAGED BLOCK"
+      block: |
+        [database]
+        connection = mysql+pymysql://keystone:keystonepass@localhost/keystone
+
+  - name: Initialize Keystone DB
+    shell: su -s /bin/sh -c "keystone-manage db_sync" keystone
+
+  - name: Bootstrap Keystone
+    shell: |
+      keystone-manage bootstrap --bootstrap-password adminpass \
+        --bootstrap-admin-url http://localhost:5000/v3/ \
+        --bootstrap-internal-url http://localhost:5000/v3/ \
+        --bootstrap-public-url http://localhost:5000/v3/ \
+        --bootstrap-region-id RegionOne
+
+  - name: Create OpenStack environment file
+    copy:
+      dest: /root/admin-openrc.sh
+      content: |
+        export OS_USERNAME=admin
+        export OS_PASSWORD=adminpass
+        export OS_PROJECT_NAME=admin
+        export OS_USER_DOMAIN_NAME=Default
+        export OS_PROJECT_DOMAIN_NAME=Default
+        export OS_AUTH_URL=http://localhost:5000/v3
+        export OS_IDENTITY_API_VERSION=3
+
+  - name: Source admin credentials
+    shell: source /root/admin-openrc.sh
+
+  - name: Configure Glance
+    blockinfile:
+      path: /etc/glance/glance-api.conf
+      marker: "# {mark} ANSIBLE MANAGED BLOCK"
+      block: |
+        [database]
+        connection = mysql+pymysql://glance:glancepass@localhost/glance
+
+  - name: Initialize Glance DB
+    shell: su -s /bin/sh -c "glance-manage db_sync" glance
+
+  - name: Configure Nova
+    blockinfile:
+      path: /etc/nova/nova.conf
+      marker: "# {mark} ANSIBLE MANAGED BLOCK"
+      block: |
+        [database]
+        connection = mysql+pymysql://nova:novapass@localhost/nova
+        [api_database]
+        connection = mysql+pymysql://nova:novapass@localhost/nova_api
+
+  - name: Initialize Nova DB
+    shell: su -s /bin/sh -c "nova-manage db_sync" nova
+
+  - name: Restart OpenStack services
+    service:
+      name: "{{ item }}"
+      state: restarted
+    loop:
+      - keystone
+      - glance-api
+      - nova-api
+      - nova-conductor
+      - nova-scheduler
